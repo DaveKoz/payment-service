@@ -9,6 +9,7 @@ from .utils import retry, lock
 from .redis_conn import redis_conn
 from .statsd import statsd
 from .blockchain import Blockchain, get_sdk
+from kin import KinErrors
 
 
 q = Queue(connection=redis_conn)
@@ -48,11 +49,11 @@ def __enqueue_callback(callback: str, app_id: str, objekt: str, state: str, acti
     log.info('enqueue result', result=result, value=value)
 
 
-def enqueue_report_wallet_balance(root_wallet_address, channel_wallet_addresses):
+def enqueue_report_wallet_balance(root_wallet_address, channel_wallet_address):
     q.enqueue(
         report_balance,
         root_wallet_address,
-        channel_wallet_addresses)
+        channel_wallet_address)
 
 
 def enqueue_payment_callback(callback: str, wallet_address: str, value: Payment):
@@ -125,13 +126,11 @@ def call_callback(callback: str, app_id: str, objekt: str, state: str, action: s
 
 def pay_and_callback(payment_request: dict):
     """lock, try to pay and callback."""
-    log.info('pay_and_callback recieved', payment_request=payment_request)
+    log.info('pay_and_callback received', payment_request=payment_request)
     payment_request = PaymentRequest(payment_request)
     with lock(redis_conn, 'payment:{}'.format(payment_request.id), blocking_timeout=120):
         try:
             payment = pay(payment_request)
-        except kin.AccountNotActivatedError:
-            enqueue_payment_failed_callback(payment_request, "no trustline")
         except Exception as e:
             enqueue_payment_failed_callback(payment_request, str(e))
             raise  # crash the job
@@ -140,19 +139,19 @@ def pay_and_callback(payment_request: dict):
 
 
 def create_wallet_and_callback(wallet_request: dict):
-    log.info('create_wallet_and_callback recieved', wallet_request=wallet_request)
+    log.info('create_wallet_and_callback received', wallet_request=wallet_request)
     wallet_request = WalletRequest(wallet_request)
 
-    @retry(10, 0.25, ignore=[kin.AccountExistsError, kin.LowBalanceError])
+    @retry(10, 0.25, ignore=[KinErrors.AccountExistsError, KinErrors.LowBalanceError])
     def create_wallet(blockchain, wallet_request):
-        return blockchain.create_wallet(wallet_request.wallet_address, wallet_request.app_id)
+        return blockchain.create_wallet(wallet_request.wallet_address)
 
     try:
-        with get_sdk(config.STELLAR_BASE_SEED) as blockchain:
+        with get_sdk(config.STELLAR_BASE_SEED, wallet_request.app_id) as blockchain:
             create_wallet(blockchain, wallet_request)
-            enqueue_report_wallet_balance(blockchain.root_address, blockchain.channel_addresses)
+            enqueue_report_wallet_balance(blockchain.root_address, blockchain.channel_address)
 
-    except kin.AccountExistsError:
+    except KinErrors.AccountExistsError:
         statsd.increment('wallet.exists', tags=['app_id:%s' % wallet_request.app_id])
         enqueue_wallet_failed_callback(wallet_request, "account exists")
         log.info('wallet already exists - ok', public_address=wallet_request.wallet_address)
@@ -181,19 +180,18 @@ def pay(payment_request: PaymentRequest):
 
     # XXX retry on retry-able errors
     try:
-        with get_sdk(config.STELLAR_BASE_SEED) as blockchain:
+        with get_sdk(config.STELLAR_BASE_SEED, payment_request.app_id) as blockchain:
             tx_id = blockchain.pay_to(
                 payment_request.recipient_address,
                 payment_request.amount,
-                payment_request.app_id,
                 payment_request.id)
-            enqueue_report_wallet_balance(blockchain.root_address, blockchain.channel_addresses)
+            enqueue_report_wallet_balance(blockchain.root_address, blockchain.channel_address)
 
         log.info('paid transaction', tx_id=tx_id, payment_id=payment_request.id)
         statsd.inc_count('transaction.paid',
                          payment_request.amount,
                          tags=['app_id:%s' % payment_request.app_id])
-    except (kin.AccountNotFoundError, kin.AccountNotActivatedError) as e:
+    except (KinErrors.AccountNotFoundError, KinErrors.AccountNotActivatedError) as e:
         raise PersitentError(e)
     except Exception as e:
         statsd.increment('transaction.failed',
@@ -209,7 +207,7 @@ def pay(payment_request: PaymentRequest):
     return payment
 
 
-def report_balance(root_address, channel_addresses):
+def report_balance(root_address, channel_address):
     """report root wallet balance metrics to statsd."""
     try:
         wallet = Blockchain.get_wallet(root_address)
@@ -217,10 +215,9 @@ def report_balance(root_address, channel_addresses):
                      tags=['address:%s' % root_address])
         statsd.gauge('root_wallet.native_balance', wallet.native_balance,
                      tags=['address:%s' % root_address])
-        for channel_address in channel_addresses:
-            wallet = Blockchain.get_wallet(channel_address)
-            statsd.gauge('channel_wallet.native_balance', wallet.native_balance,
-                         tags=['address:%s' % channel_address])
+        wallet = Blockchain.get_wallet(channel_address)
+        statsd.gauge('channel_wallet.native_balance', wallet.native_balance,
+                     tags=['address:%s' % channel_address])
 
     except Exception:
         pass  # don't fail
