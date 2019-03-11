@@ -35,8 +35,8 @@ if __name__ == '__main__':
     # generates a file that can be 'sourced' and creates environment vars for
     # payment-service
     keys = Keypair()
-    public_address = keys.public_address()
-    private_seed = keys.secret_seed()
+    public_address = keys.public_address
+    private_seed = keys.secret_seed
 
     print('# creating %s' % public_address)
     fund_kin(public_address)
